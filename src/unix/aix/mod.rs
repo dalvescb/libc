@@ -1,3 +1,33 @@
+/*-
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Copyright (c) 1990, 1993, 1994
+ *	The Regents of the University of California.  All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the University nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
 use crate::prelude::*;
 use crate::{in_addr_t, in_port_t};
 
@@ -2117,6 +2147,7 @@ pub const TIOCMBIS: c_int = -2147191700;
 pub const TIOCMBIC: c_int = -2147191701;
 pub const TIOCMGET: c_int = 1074033770;
 pub const TIOCREMOTE: c_int = -2147191703;
+pub const TIOCSCTTY: c_int = 0x20007461;
 
 // sys/user.h
 pub const MAXCOMLEN: c_int = 32;
@@ -3355,6 +3386,121 @@ extern "C" {
 
     // Use AIX thread-safe version errno.
     pub fn _Errno() -> *mut c_int;
+}
+
+unsafe fn bail(master: c_int, slave: c_int) -> c_int {
+    let e = *crate::_Errno();
+    if slave >= 0 {
+        crate::close(slave);
+    }
+    if master >= 0 {
+        crate::close(master);
+    }
+    *crate::_Errno() = e;
+    return -1;
+}
+
+const PTEM: &[u8] = b"ptem\0";
+const LDTERM: &[u8] = b"ldterm\0";
+
+pub unsafe fn openpty(
+    amaster: *mut c_int,
+    aslave: *mut c_int,
+    name: *mut c_char,
+    termp: *mut crate::termios,
+    winp: *mut crate::winsize) -> c_int {
+
+    let master: c_int = crate::posix_openpt(crate::O_RDWR|crate::O_NOCTTY);
+
+    if master < 0 {
+       return -1
+    }
+
+    let grant_result = crate::grantpt(master);
+    if grant_result < 0 {
+        return bail(master,-1);
+    }
+
+    let unlock_result = crate::unlockpt(master);
+    if unlock_result < 0 {
+        return bail(master,-1);
+    }
+
+    let slavename = crate::ptsname(master);
+    if slavename.is_null() {
+        return bail(master,-1)
+    }
+    let slave = crate::open(slavename,crate::O_RDWR | crate::O_NOCTTY);
+    if slave < 0 {
+        return bail(master,-1)
+    }
+
+    if !winp.is_null() && crate::ioctl(slave,crate::TIOCSWINSZ,winp) < 0 {
+        return bail(master,slave);
+    }
+
+    if !name.is_null() {
+       crate::strcpy(name,slavename);
+    }
+
+    unsafe { *amaster = master };
+    unsafe { *aslave = slave };
+    0
+}
+
+pub unsafe fn forkpty(
+    amaster: *mut c_int,
+    name: *mut c_char,
+    termp: *mut crate::termios,
+    winp: *mut crate::winsize) -> crate::pid_t {
+    let mut slave: c_int = -1;
+    let aslave: *mut c_int = &mut slave as *mut c_int;
+    let openpty_result = unsafe { crate::openpty(amaster,aslave,name,termp,winp) };
+    if openpty_result == -1 {
+        return -1
+    }
+    let pid = crate::fork();
+    let master = unsafe { *amaster };
+    if pid == -1 {
+        crate::close(master);
+        crate::close(slave);
+        return -1
+    }
+    if pid == 0 {
+        // child
+        crate::close(master);
+        login_tty(slave);
+        return 0
+    }
+    crate::close(slave);
+    return pid
+}
+
+pub unsafe fn tcsetsid(fd: c_int, pid: crate::pid_t) -> c_int {
+    let s = crate::getsid(0);
+    if pid != s {
+        return -1
+    }
+
+    crate::ioctl(fd,crate::TIOCSCTTY,core::ptr::null::<crate::c_void>())
+}
+
+pub unsafe fn login_tty(fd: c_int) -> c_int {
+    let mut s: crate::pid_t = crate::setsid();
+    if s == -1 {
+        s = crate::getsid(0);
+    }
+    if crate::tcsetsid(fd,s) == -1 {
+        return -1
+    }
+
+    crate::dup2(fd,0);
+    crate::dup2(fd,1);
+    crate::dup2(fd,2);
+    if fd > 2 {
+        crate::close(fd);
+    }
+    return 0
 }
 
 cfg_if! {
